@@ -1,6 +1,8 @@
-
 //#include <avr/pgmspace.h>
 #include "epdpaint.h"
+
+// Предвычисленная таблица масок
+static const unsigned char bit_masks[8] = {0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01};
 
 unsigned char image[768];
 unsigned char* pimage;
@@ -8,6 +10,7 @@ int pwidth;
 int pheight;
 int protate;
 int pinvert;
+int pwidth_bytes;  // Для оптимизации: байт на строку
 
 void PaintPaint(unsigned char* image, int width, int height) {
     pinvert = IF_INVERT_COLOR;
@@ -16,10 +19,12 @@ void PaintPaint(unsigned char* image, int width, int height) {
     /* 1 byte = 8 pixels, so the width should be the multiple of 8 */
     pwidth = width % 8 ? width + 8 - (width % 8) : width;
     pheight = height;
+    pwidth_bytes = (pwidth + 7) / 8;  // Предвычисляем байты на строку
 }
 
 void PaintSetWidth(int width) {
     pwidth = width % 8 ? width + 8 - (width % 8) : width;
+    pwidth_bytes = (pwidth + 7) / 8;  // Обновляем байты на строку
 }
 
 void PaintSetHeight(int height) {
@@ -30,11 +35,136 @@ void PaintSetRotate(int rotate){
     protate = rotate;
 }
 
+// Быстрая очистка буфера
 void PaintClear(int colored) {
-    for (int x = 0; x < pwidth; x++) {
-        for (int y = 0; y < pheight; y++) {
-            PaintDrawAbsolutePixel(x, y, colored);
+    unsigned char fill_byte;
+    
+    if (pinvert) {
+        fill_byte = colored ? 0xFF : 0x00;
+    } else {
+        fill_byte = colored ? 0x00 : 0xFF;
+    }
+    
+    // Заполняем побайтово вместо посепиксельно
+    int total_bytes = pwidth_bytes * pheight;
+    for (int i = 0; i < total_bytes; i++) {
+        pimage[i] = fill_byte;
+    }
+}
+
+// Быстрая отрисовка пикселя (инлайн для производительности)
+static inline void PaintDrawAbsolutePixelFast(int x, int y, int colored) {
+    if (x < 0 || x >= pwidth || y < 0 || y >= pheight) {
+        return;
+    }
+    
+    int byte_index = (x >> 3) + y * pwidth_bytes;  // Оптимизация: >>3 вместо /8
+    unsigned char bit_mask = bit_masks[x & 7];      // Таблица вместо 0x80 >> (x % 8)
+    
+    if (pinvert) {
+        if (colored) {
+            pimage[byte_index] |= bit_mask;
+        } else {
+            pimage[byte_index] &= ~bit_mask;
         }
+    } else {
+        if (colored) {
+            pimage[byte_index] &= ~bit_mask;
+        } else {
+            pimage[byte_index] |= bit_mask;
+        }
+    }
+}
+
+// Старая версия для совместимости
+void PaintDrawAbsolutePixel(int x, int y, int colored) {
+    if (x < 0 || x >= pwidth || y < 0 || y >= pheight) {
+        return;
+    }
+    // Используем таблицу масок вместо вычисления
+    if (pinvert) {
+        if (colored) {
+            pimage[(x + y * pwidth) / 8] |= bit_masks[x % 8];  // Используем таблицу
+        } else {
+            pimage[(x + y * pwidth) / 8] &= ~bit_masks[x % 8]; // Используем таблицу
+        }
+    } else {
+        if (colored) {
+            pimage[(x + y * pwidth) / 8] &= ~bit_masks[x % 8]; // Используем таблицу
+        } else {
+            pimage[(x + y * pwidth) / 8] |= bit_masks[x % 8];  // Используем таблицу
+        }
+    }
+}
+
+void PaintDrawPixel(int x, int y, int colored) {
+    int point_temp;
+    if (protate == ROTATE_0) {
+        if(x < 0 || x >= pwidth || y < 0 || y >= pheight) {
+            return;
+        }
+        PaintDrawAbsolutePixelFast(x, y, colored);  // Используем быструю версию
+    } else if (protate == ROTATE_90) {
+        if(x < 0 || x >= pheight || y < 0 || y >= pwidth) {
+          return;
+        }
+        point_temp = x;
+        x = pwidth - y;
+        y = point_temp;
+        PaintDrawAbsolutePixelFast(x-1, y, colored);  // Используем быструю версию
+    } else if (protate == ROTATE_180) {
+        if(x < 0 || x >= pwidth || y < 0 || y >= pheight) {
+          return;
+        }
+        x = pwidth - x;
+        y = pheight - y;
+        PaintDrawAbsolutePixelFast(x-1, y-1, colored);  // Используем быструю версию
+    } else if (protate == ROTATE_270) {
+        if(x < 0 || x >= pheight || y < 0 || y >= pwidth) {
+          return;
+        }
+        point_temp = x;
+        x = y;
+        y = pheight - point_temp;
+        PaintDrawAbsolutePixelFast(x, y-1, colored);  // Используем быструю версию
+    }
+}
+
+void PaintSetInvert(int invert) {
+  pinvert = invert;
+}
+
+// Оптимизированная версия отрисовки изображения
+void PaintDrawImage(const unsigned char* imgData, int x, int y, int Width, int Height, int colored) {
+  int i, j;
+  const unsigned char* prt = imgData;
+  int byteWidth = (Width + 7) / 8;  // Предвычисляем байты на строку
+  
+    for (j = 0; j < Height; j++) {
+        for (i = 0; i < Width; i++) {
+          // Используем таблицу масок и быстрый доступ
+          if (prt[i >> 3] & bit_masks[i & 7]) {
+            PaintDrawPixel(x + i, y + j, colored);            
+          }
+        }
+        prt += byteWidth;  // Переходим к следующей строке
+    }
+}
+        
+void PaintDrawCharAt(int x, int y, char ascii_char, sFONT* font, int colored) {
+    int i, j;
+    unsigned int char_offset = (ascii_char - ' ') * font->Height * (font->Width / 8 + (font->Width % 8 ? 1 : 0));
+    const unsigned char* ptr = &font->table[char_offset];
+    int byteWidth = (font->Width + 7) / 8;  // Предвычисляем байты на строку
+
+    for (j = 0; j < font->Height; j++) {
+        for (i = 0; i < font->Width; i++) {
+          // Используем таблицу масок и быстрый доступ
+          if (ptr[i >> 3] & bit_masks[i & 7]) {     
+                PaintDrawPixel(x + i, y + j, colored);
+            }
+        }
+        ptr += byteWidth;  // Переходим к следующей строке
     }
 }
 
@@ -52,101 +182,6 @@ void PaintDrawStringAt(int x, int y, const char* text, sFONT* font, int colored)
         /* Point on the next character */
         p_text++;
         counter++;
-    }
-}
-
-void PaintDrawImage(const unsigned char* imgData, int x, int y, int Width, int Height, int colored) {
-  int i, j;
-  const unsigned char* prt = imgData;
-    for (j = 0; j < Height; j++) {
-        for (i = 0; i < Width; i++) {
-          if (* prt & (0x80 >> (i % 8))){
-            PaintDrawPixel(x + i, y + j, colored);            
-          }
-          if (i % 8 == 7) {
-            prt++;
-          }
-        }
-        if (Width % 8 != 0) {
-          prt++;
-        }
-    }
-}
-        
-void PaintDrawCharAt(int x, int y, char ascii_char, sFONT* font, int colored) {
-    int i, j;
-    unsigned int char_offset = (ascii_char - ' ') * font->Height * (font->Width / 8 + (font->Width % 8 ? 1 : 0));
-    const unsigned char* ptr = &font->table[char_offset];
-
-    for (j = 0; j < font->Height; j++) {
-        for (i = 0; i < font->Width; i++) {
-          if (*ptr & (0x80 >> (i % 8))) {     
-                PaintDrawPixel(x + i, y + j, colored);
-            }
-            if (i % 8 == 7) {
-                ptr++;
-            }
-        }
-        if (font->Width % 8 != 0) {
-            ptr++;
-        }
-    }
-}
-
-void PaintDrawPixel(int x, int y, int colored) {
-    int point_temp;
-    if (protate == ROTATE_0) {
-        if(x < 0 || x >= pwidth || y < 0 || y >= pheight) {
-            return;
-        }
-        PaintDrawAbsolutePixel(x, y, colored);
-    } else if (protate == ROTATE_90) {
-        if(x < 0 || x >= pheight || y < 0 || y >= pwidth) {
-          return;
-        }
-        point_temp = x;
-        x = pwidth - y;
-        y = point_temp;
-        PaintDrawAbsolutePixel(x-1, y, colored);
-    } else if (protate == ROTATE_180) {
-        if(x < 0 || x >= pwidth || y < 0 || y >= pheight) {
-          return;
-        }
-        x = pwidth - x;
-        y = pheight - y;
-        PaintDrawAbsolutePixel(x-1, y-1, colored);
-    } else if (protate == ROTATE_270) {
-        if(x < 0 || x >= pheight || y < 0 || y >= pwidth) {
-          return;
-        }
-        point_temp = x;
-        x = y;
-        y = pheight - point_temp;
-        PaintDrawAbsolutePixel(x, y-1, colored);
-    }
-}
-
-void PaintSetInvert(int invert) {
-  pinvert = invert;
-}
-
-void PaintDrawAbsolutePixel(int x, int y, int colored) {
-    if (x < 0 || x >= pwidth || y < 0 || y >= pheight) {
-        return;
-    }
-//    if (IF_INVERT_COLOR) {
-    if (pinvert) {
-        if (colored) {
-            pimage[(x + y * pwidth) / 8] |= 0x80 >> (x % 8);
-        } else {
-            pimage[(x + y * pwidth) / 8] &= ~(0x80 >> (x % 8));
-        }
-    } else {
-        if (colored) {
-            pimage[(x + y * pwidth) / 8] &= ~(0x80 >> (x % 8));
-        } else {
-            pimage[(x + y * pwidth) / 8] |= 0x80 >> (x % 8);
-        }
     }
 }
 
